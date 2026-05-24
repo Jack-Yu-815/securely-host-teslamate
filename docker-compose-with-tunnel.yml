@@ -1,0 +1,138 @@
+services:
+  teslamate:
+    image: teslamate/teslamate:latest
+    restart: always
+    depends_on:
+      - database
+    environment:
+      - ENCRYPTION_KEY=${TM_ENCRYPTION_KEY}
+      - DATABASE_USER=${TM_DB_USER}
+      - DATABASE_PASS=${TM_DB_PASS}
+      - DATABASE_NAME=${TM_DB_NAME}
+      - DATABASE_HOST=database
+      - MQTT_HOST=mosquitto
+      - VIRTUAL_HOST=${FQDN_TM}
+      - CHECK_ORIGIN=true
+      - TZ=${TM_TZ}
+    volumes:
+      - ./import:/opt/app/import
+    labels:
+      traefik.enable: "true"
+      traefik.port: "4000"
+      # Remove HTTPS redirect since Cloudflare Tunnel handles this
+      # traefik.http.middlewares.redirect.redirectscheme.scheme: "https"
+      traefik.http.middlewares.teslamate-auth.basicauth.realm: "teslamate"
+      traefik.http.middlewares.teslamate-auth.basicauth.usersfile: "/auth/.htpasswd"
+      # Simplify routing - no need for separate HTTP/HTTPS routers
+      traefik.http.routers.teslamate.rule: "Host(`${FQDN_TM}`)"
+      traefik.http.routers.teslamate.middlewares: "teslamate-auth"
+      traefik.http.routers.teslamate.entrypoints: "web"
+      # Remove TLS configuration since Cloudflare Tunnel handles SSL
+      # traefik.http.routers.teslamate.entrypoints: "websecure"
+      # traefik.http.routers.teslamate.tls.certresolver: "tmhttpchallenge"
+
+      # WebSocket support
+      traefik.http.routers.teslamate-ws.rule: "Host(`${FQDN_TM}`) && Path(`/live/websocket`)"
+      traefik.http.routers.teslamate-ws.entrypoints: "web"
+
+    cap_drop:
+      - ALL
+
+  database:
+    image: postgres:17
+    restart: always
+    environment:
+      - POSTGRES_USER=${TM_DB_USER}
+      - POSTGRES_PASSWORD=${TM_DB_PASS}
+      - POSTGRES_DB=${TM_DB_NAME}
+    volumes:
+      - teslamate-db:/var/lib/postgresql/data
+
+  grafana:
+    image: teslamate/grafana:latest
+    restart: always
+    environment:
+      - DATABASE_USER=${TM_DB_USER}
+      - DATABASE_PASS=${TM_DB_PASS}
+      - DATABASE_NAME=${TM_DB_NAME}
+      - DATABASE_HOST=database
+      - GRAFANA_PASSWD=${GRAFANA_PW}
+      - GF_SECURITY_ADMIN_USER=${GRAFANA_USER}
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PW}
+      - GF_AUTH_ANONYMOUS_ENABLED=false
+      - GF_SERVER_DOMAIN=${FQDN_TM}
+      - GF_SERVER_ROOT_URL=%(protocol)s://%(domain)s/grafana
+      - GF_SERVER_SERVE_FROM_SUB_PATH=true
+
+    volumes:
+      - teslamate-grafana-data:/var/lib/grafana
+    labels:
+      traefik.enable: "true"
+      traefik.port: "3000"
+      # Remove HTTPS redirect
+      # traefik.http.middlewares.redirect.redirectscheme.scheme: "https"
+      traefik.http.routers.grafana.rule: "Host(`${FQDN_TM}`) && (Path(`/grafana`) || PathPrefix(`/grafana/`))"
+      traefik.http.routers.grafana.entrypoints: "web"
+      # Remove TLS configuration
+      # traefik.http.routers.grafana.entrypoints: "websecure"
+      # traefik.http.routers.grafana.tls.certresolver: "tmhttpchallenge"
+
+  mosquitto:
+    image: eclipse-mosquitto:2
+    restart: always
+    command: mosquitto -c /mosquitto-no-auth.conf
+    ports:
+      - "127.0.0.1:1883:1883"
+    volumes:
+      - mosquitto-conf:/mosquitto/config
+      - mosquitto-data:/mosquitto/data
+
+  proxy:
+    image: traefik:v2.7
+    restart: always
+    command:
+      - "--global.sendAnonymousUsage=false"
+      - "--providers.docker"
+      - "--providers.docker.exposedByDefault=false"
+      - "--entrypoints.web.address=:80"
+      - "--entrypoints.websecure.address=:443"
+      # Remove Let's Encrypt configuration since Cloudflare Tunnel handles SSL
+      # - "--certificatesresolvers.tmhttpchallenge.acme.httpchallenge=true"
+      # - "--certificatesresolvers.tmhttpchallenge.acme.httpchallenge.entrypoint=web"
+      # - "--certificatesresolvers.tmhttpchallenge.acme.email=${LETSENCRYPT_EMAIL}"
+      # - "--certificatesresolvers.tmhttpchallenge.acme.storage=/etc/acme/acme.json"
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./.htpasswd:/auth/.htpasswd
+      # Remove acme volume since we're not using Let's Encrypt
+      # - ./acme/:/etc/acme/
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+  
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    restart: always
+    command: tunnel run --token ${CLOUDFLARE_TUNNEL_TOKEN}
+    environment:
+      - TZ=${TM_TZ}
+    depends_on:
+      - proxy
+    networks:
+      - default
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  teslamate-db:
+  teslamate-grafana-data:
+  mosquitto-conf:
+  mosquitto-data:
